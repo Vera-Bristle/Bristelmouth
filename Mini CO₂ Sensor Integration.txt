@@ -1,0 +1,197 @@
+// Mini CO₂ Sensor Integration with Timed Sampling for Bristlemouth Dev Kit
+// Samples every 1 minute, records for 1 minute
+// Logs corrected_CO₂, sensor_temp, gas_pressure, ir_temp, supply_voltage
+// -------------------------------------------------------------
+
+#include "user_code.h"
+#include "bristlefin.h"
+#include "payload_uart.h"
+#include "task_priorities.h"
+#include "uptime.h"
+#include "stm32_rtc.h"
+#include "bm_printf.h"
+
+#define LED_ON_TIME_MS 20
+#define LED_PERIOD_MS 1000
+#define DEFAULT_BAUD_RATE 19200
+#define DEFAULT_LINE_TERM 10  // '\n'
+
+#define SAMPLE_INTERVAL_MS (5 * 60 * 1000)  // 5 minutes in milliseconds
+#define SAMPLE_DURATION_MS (1 * 60 * 1000)  // 1 minute in milliseconds
+
+
+extern Bristlefin bristlefin;
+extern cfg::Configuration *userConfigurationPartition;
+
+static uint32_t baud_rate_config = DEFAULT_BAUD_RATE;
+static uint32_t line_term_config = DEFAULT_LINE_TERM;
+static uint64_t last_sample_start_ms = 0;
+static bool sampling_active = false;
+
+char payload_buffer[256];
+
+// -------------------------------------------------------------
+// Simple stats collector for CO₂ values
+// -------------------------------------------------------------
+class AveragingSampler {
+  float sum = 0.0f;
+  int count = 0;
+  float minVal = 1e30f;
+  float maxVal = -1e30f;
+public:
+  void addSample(float val) {
+    sum += val;
+    count++;
+    if (val < minVal) minVal = val;
+    if (val > maxVal) maxVal = val;
+  }
+  float getAverage() const { return (count > 0) ? sum / count : 0.0f; }
+  float getMin() const { return (count > 0) ? minVal : 0.0f; }
+  float getMax() const { return (count > 0) ? maxVal : 0.0f; }
+  int sampleCount() const { return count; }
+  void reset() {
+    sum = 0.0f;
+    count = 0;
+    minVal = 1e30f;
+    maxVal = -1e30f;
+  }
+};
+
+static AveragingSampler co2_stats;
+
+void setup() {
+  printf("Mini CO₂ setup() started\n");
+
+  userConfigurationPartition->getConfig("plUartBaudRate", strlen("plUartBaudRate"), baud_rate_config);
+  userConfigurationPartition->getConfig("plUartLineTerm", strlen("plUartLineTerm"), line_term_config);
+
+  last_sample_start_ms = uptimeGetMs();
+}
+
+void loop() {
+  uint64_t now = uptimeGetMs();
+
+  // ---------- Timed Sampling Control ----------
+  if (!sampling_active && now - last_sample_start_ms >= SAMPLE_INTERVAL_MS) {
+    // Start sampling
+    bristlefin.enableVbus();
+    vTaskDelay(pdMS_TO_TICKS(10));
+    bristlefin.enableVout();
+
+    PLUART::init(USER_TASK_PRIORITY);
+    PLUART::setBaud(baud_rate_config);
+    PLUART::setTerminationCharacter((char)line_term_config);
+    PLUART::setUseByteStreamBuffer(false);
+    PLUART::setUseLineBuffer(true);
+    PLUART::enable();
+
+    vTaskDelay(pdMS_TO_TICKS(500)); // sensor boot time
+
+    uint8_t startCmd[] = "1\r";
+    PLUART::write(startCmd, sizeof(startCmd) - 1);
+
+    sampling_active = true;
+    last_sample_start_ms = now;
+    printf("Sampling started\n");
+  }
+
+  // ---------- Sampling End ----------
+  if (sampling_active && now - last_sample_start_ms >= SAMPLE_DURATION_MS) {
+    // Stop sampling
+    uint8_t stopCmd[] = "2\r";
+    PLUART::write(stopCmd, sizeof(stopCmd) - 1);
+
+    bristlefin.disableVout();
+    bristlefin.disableVbus();
+
+    // Timestamp
+    RTCTimeAndDate_t time_and_date = {};
+    rtcGet(&time_and_date);
+    char rtcBuffer[32];
+    rtcPrint(rtcBuffer, &time_and_date);
+
+    // Console summary
+    printf("[CO2_STATS] samples: %d, avg: %.3f, min: %.3f, max: %.3f\n",
+           co2_stats.sampleCount(),
+           co2_stats.getAverage(),
+           co2_stats.getMin(),
+           co2_stats.getMax());
+
+    // Also print to Spotter USB console
+    printf("[sensor-agg] | tick: %llu, rtc: %s, co2_n: %d, co2_avg: %.3f, co2_min: %.3f, co2_max: %.3f\n",
+           uptimeGetMs(), rtcBuffer,
+           co2_stats.sampleCount(),
+           co2_stats.getAverage(),
+           co2_stats.getMin(),
+           co2_stats.getMax());
+
+    // Spotter log broadcast
+    bm_printf(0, "[sensor-agg] | tick: %llu, rtc: %s, co2_n: %d, co2_avg: %.3f, co2_min: %.3f, co2_max: %.3f",
+              uptimeGetMs(), rtcBuffer,
+              co2_stats.sampleCount(),
+              co2_stats.getAverage(),
+              co2_stats.getMin(),
+              co2_stats.getMax());
+
+    co2_stats.reset();
+    sampling_active = false;
+    last_sample_start_ms = now;
+
+    printf("Sampling stopped\n");
+  }
+
+  // ---------- LED Heartbeat ----------
+  static bool led1State = false;
+  static uint32_t ledPulseTimer = uptimeGetMs();
+  static uint32_t ledOnTimer = 0;
+
+  if (!led1State && uptimeGetMs() - ledPulseTimer >= LED_PERIOD_MS) {
+    bristlefin.setLed(1, Bristlefin::LED_GREEN);
+    ledOnTimer = uptimeGetMs();
+    ledPulseTimer += LED_PERIOD_MS;
+    led1State = true;
+  } else if (led1State && uptimeGetMs() - ledOnTimer >= LED_ON_TIME_MS) {
+    bristlefin.setLed(1, Bristlefin::LED_OFF);
+    led1State = false;
+  }
+
+  // ---------- Sensor Data Parsing ----------
+  if (sampling_active && PLUART::lineAvailable()) {
+    uint16_t read_len = PLUART::readLine(payload_buffer, sizeof(payload_buffer) - 1);
+    payload_buffer[read_len] = '\0';
+
+    char *tokens[21] = {};
+    uint8_t i = 0;
+    char *tok = strtok(payload_buffer, ",");
+    while (tok && i < 21) {
+      tokens[i++] = tok;
+      tok = strtok(nullptr, ",");
+    }
+
+    // Extract and parse sensor fields
+    float corrected_CO2   = tokens[10] ? atof(tokens[10]) : -1.0;
+    float sensor_temp     = tokens[11] ? atof(tokens[11]) : -1.0;
+    float gas_pressure    = tokens[12] ? atof(tokens[12]) : -1.0;
+    float ir_temp         = tokens[13] ? atof(tokens[13]) : -1.0;
+    float supply_voltage  = tokens[14] ? atof(tokens[14]) : -1.0;
+
+    if (corrected_CO2 >= 0.0f) {
+      co2_stats.addSample(corrected_CO2);
+    }
+
+    // Timestamp
+    RTCTimeAndDate_t time_and_date = {};
+    rtcGet(&time_and_date);
+    char rtcBuffer[32];
+    rtcPrint(rtcBuffer, &time_and_date);
+
+    // Console output
+    printf("[payload] | tick: %llu, rtc: %s, line: %.3f, %.2f, %.2f, %.2f, %.2f\n",
+           uptimeGetMs(), rtcBuffer, corrected_CO2, sensor_temp, gas_pressure, ir_temp, supply_voltage);
+
+    // SD logging
+    bm_fprintf(0, "payload_data.log",
+               "tick: %llu, rtc: %s, line: %.3f, %.2f, %.2f, %.2f, %.2f\n",
+               uptimeGetMs(), rtcBuffer, corrected_CO2, sensor_temp, gas_pressure, ir_temp, supply_voltage);
+  }
+}
