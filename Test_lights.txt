@@ -1,0 +1,46 @@
+//This works perfectly- if you want to check if you are flashing it correctly 
+
+
+#include "bm_printf.h"
+#include "bristlefin.h"
+#include "uptime.h"
+#include "task_priorities.h"
+#include "FreeRTOS.h"
+#include "task.h"
+
+extern Bristlefin bristlefin;  //  Declare the bristlefin object
+
+void setup() {
+  bm_printf(0, "setup() started\n");
+
+  bristlefin.enableVbus();
+  vTaskDelay(pdMS_TO_TICKS(5));
+  bristlefin.enableVout();
+
+  bm_printf(0, "Vbus and Vout enabled\n");
+}
+
+void loop() {
+  // LED1 pulse
+  bristlefin.setLed(1, Bristlefin::LED_GREEN);
+  bm_printf(0, "LED1 ON | Tick: %llu\n", uptimeGetMs());
+  vTaskDelay(pdMS_TO_TICKS(200));
+  bristlefin.setLed(1, Bristlefin::LED_OFF);
+  bm_printf(0, "LED1 OFF | Tick: %llu\n", uptimeGetMs());
+  vTaskDelay(pdMS_TO_TICKS(800));
+
+  // LED2 pulse
+  bristlefin.setLed(2, Bristlefin::LED_RED);  // Use correct enum
+  bm_printf(0, "LED2 ON | Tick: %llu\n", uptimeGetMs());
+  vTaskDelay(pdMS_TO_TICKS(100));
+  bristlefin.setLed(2, Bristlefin::LED_OFF);
+  bm_printf(0, "LED2 OFF | Tick: %llu\n", uptimeGetMs());
+  vTaskDelay(pdMS_TO_TICKS(300));
+}
+
+extern "C" void app_main() {
+  setup();
+  while (1) {
+    loop();
+  }
+}
